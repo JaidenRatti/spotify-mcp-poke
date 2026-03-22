@@ -1,4 +1,9 @@
+import json
 import os
+
+from dotenv import load_dotenv
+
+load_dotenv()
 
 import spotipy
 import uvicorn
@@ -22,6 +27,10 @@ SCOPES = " ".join(
         "user-read-recently-played",
         "playlist-read-private",
         "playlist-read-collaborative",
+        "playlist-modify-public",
+        "playlist-modify-private",
+        "user-library-modify",
+        "user-library-read",
     ]
 )
 
@@ -34,13 +43,20 @@ def _get_spotify() -> spotipy.Spotify:
 
     client_id = os.environ.get("SPOTIFY_CLIENT_ID")
     client_secret = os.environ.get("SPOTIFY_CLIENT_SECRET")
-    redirect_uri = os.environ.get("SPOTIFY_REDIRECT_URI", "http://localhost:8888/callback")
+    redirect_uri = os.environ.get("SPOTIFY_REDIRECT_URI", "http://127.0.0.1:8888/callback")
     token_cache = os.environ.get("SPOTIFY_TOKEN_CACHE", ".spotify_cache")
 
     if not client_id or not client_secret:
         raise RuntimeError(
             "SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET environment variables are required"
         )
+
+    # If SPOTIFY_TOKEN_JSON is set (for Render/deployments), write it to the cache file
+    # so spotipy can pick it up and handle refresh automatically.
+    token_json = os.environ.get("SPOTIFY_TOKEN_JSON")
+    if token_json and not os.path.exists(token_cache):
+        with open(token_cache, "w") as f:
+            f.write(token_json)
 
     auth_manager = SpotifyOAuth(
         client_id=client_id,
@@ -199,6 +215,35 @@ def search_tracks(query: str, limit: int = 10) -> str:
 
 
 @mcp.tool()
+def play_track(uri: str) -> str:
+    """Immediately play a specific track, interrupting whatever is currently playing.
+
+    Args:
+        uri: The Spotify URI of the track (e.g. "spotify:track:4iV5W9uYEdYUVa79Axb7Rh").
+             Get this from search_tracks results.
+
+    Use this when the user wants to play a specific song RIGHT NOW — not queue it.
+    This overrides the current queue and starts the track immediately.
+    Use add_to_queue instead if the user wants to add to the queue without interrupting.
+    """
+    sp = _get_spotify()
+    try:
+        sp.start_playback(uris=[uri])
+    except spotipy.exceptions.SpotifyException as e:
+        if "NO_ACTIVE_DEVICE" in str(e) or "Not found" in str(e):
+            return (
+                "No active Spotify device found. "
+                "Open Spotify on your phone, desktop, or web player and start playing something first."
+            )
+        raise
+
+    track = sp.track(uri.replace("spotify:track:", ""))
+    name = track.get("name", "Unknown")
+    artists = ", ".join(a["name"] for a in track.get("artists", []))
+    return f"Now playing **{name}** by {artists}."
+
+
+@mcp.tool()
 def add_to_queue(uri: str) -> str:
     """Add a track to the Spotify playback queue.
 
@@ -223,17 +268,22 @@ def add_to_queue(uri: str) -> str:
 
 
 @mcp.tool()
-def queue_vibes(description: str, count: int = 5) -> str:
-    """Search for tracks matching a vibe and add them all to the queue.
+def queue_vibes(description: str, count: int = 5, play_now: bool = True) -> str:
+    """Search for tracks matching a vibe and play or queue them.
 
     Args:
         description: A description of the vibe, mood, or genre
                      (e.g. "chill lo-fi beats", "90s hip hop", "energetic workout music",
                       "sad indie songs", "jazz cafe background music").
-        count: Number of tracks to queue (1-10, default 5).
+        count: Number of tracks (1-10, default 5).
+        play_now: If True (default), immediately starts playing these tracks, replacing
+                  the current queue. If False, appends them to the existing queue.
 
-    This is the power tool — describe a vibe and it finds and queues multiple matching tracks.
+    This is the power tool — describe a vibe and it finds matching tracks.
+    By default it starts playing them immediately (overriding whatever is queued).
     Call this when the user says things like "play some chill vibes" or "queue up workout music".
+    Set play_now=False only if the user explicitly says "add to queue" or "queue up" without
+    wanting to interrupt what's currently playing.
     """
     sp = _get_spotify()
     count = max(1, min(10, count))
@@ -242,28 +292,39 @@ def queue_vibes(description: str, count: int = 5) -> str:
     if not tracks:
         return f'No tracks found matching "{description}".'
 
-    queued = []
-    errors = []
+    track_uris = [t["uri"] for t in tracks]
+    track_lines = []
     for track in tracks:
-        uri = track["uri"]
+        name = track["name"]
+        artist = track["artists"][0]["name"] if track.get("artists") else "Unknown"
+        track_lines.append(f"  - **{name}** by {artist}")
+
+    if play_now:
         try:
-            sp.add_to_queue(uri)
-            name = track["name"]
-            artist = track["artists"][0]["name"] if track.get("artists") else "Unknown"
-            queued.append(f"  - **{name}** by {artist}")
+            sp.start_playback(uris=track_uris)
         except spotipy.exceptions.SpotifyException as e:
             if "NO_ACTIVE_DEVICE" in str(e) or "Not found" in str(e):
                 return (
                     "No active Spotify device found. "
                     "Open Spotify and start playing something first, then try again."
                 )
-            errors.append(f"  - Failed to queue {uri}: {e}")
+            raise
+        lines = [f'**Now playing {len(tracks)} tracks for "{description}":**\n']
+    else:
+        errors = []
+        for uri in track_uris:
+            try:
+                sp.add_to_queue(uri)
+            except spotipy.exceptions.SpotifyException as e:
+                if "NO_ACTIVE_DEVICE" in str(e) or "Not found" in str(e):
+                    return (
+                        "No active Spotify device found. "
+                        "Open Spotify and start playing something first, then try again."
+                    )
+                errors.append(str(e))
+        lines = [f'**Queued {len(tracks)} tracks for "{description}":**\n']
 
-    lines = [f'**Queued {len(queued)} tracks for "{description}":**\n']
-    lines.extend(queued)
-    if errors:
-        lines.append(f"\n**Errors ({len(errors)}):**")
-        lines.extend(errors)
+    lines.extend(track_lines)
     return "\n".join(lines)
 
 
@@ -340,6 +401,325 @@ def get_my_playlists(limit: int = 20) -> str:
         if uri:
             lines.append(f"   URI: `{uri}`")
     return "\n".join(lines)
+
+
+@mcp.tool()
+def play_playlist(uri: str, shuffle: bool = True) -> str:
+    """Start playing a playlist.
+
+    Args:
+        uri: The Spotify URI of the playlist (e.g. "spotify:playlist:37i9dQZF1DXcBWIGoYBM5M").
+             Get this from get_my_playlists results.
+        shuffle: Whether to shuffle the playlist (default True).
+
+    Call this when the user wants to play a specific playlist like "play my Discover Weekly"
+    or "put on my workout playlist".
+    """
+    sp = _get_spotify()
+    try:
+        sp.shuffle(shuffle)
+        sp.start_playback(context_uri=uri)
+    except spotipy.exceptions.SpotifyException as e:
+        if "NO_ACTIVE_DEVICE" in str(e) or "Not found" in str(e):
+            return "No active Spotify device found. Open Spotify and start playing something first."
+        raise
+    mode = "shuffle on" if shuffle else "shuffle off"
+    return f"Now playing playlist `{uri}` ({mode})."
+
+
+@mcp.tool()
+def get_recommendations(
+    seed_track_uris: list[str] | None = None,
+    seed_artists: list[str] | None = None,
+    seed_genres: list[str] | None = None,
+    energy: float | None = None,
+    danceability: float | None = None,
+    valence: float | None = None,
+    tempo: float | None = None,
+    limit: int = 10,
+) -> str:
+    """Get track recommendations from Spotify's recommendation engine.
+
+    This is much better than search for discovering music by vibe, since it uses
+    Spotify's actual audio analysis and collaborative filtering.
+
+    Args:
+        seed_track_uris: Up to 5 Spotify track URIs to use as seeds
+                         (e.g. ["spotify:track:4iV5W9uYEdYUVa79Axb7Rh"]).
+        seed_artists: Up to 5 Spotify artist URIs to seed from.
+        seed_genres: Up to 5 genre names (e.g. ["indie", "lo-fi", "jazz"]).
+                     Total seeds (tracks + artists + genres) must be 1-5.
+        energy: Target energy 0.0-1.0 (0 = calm, 1 = intense).
+        danceability: Target danceability 0.0-1.0.
+        valence: Target mood 0.0-1.0 (0 = sad/dark, 1 = happy/cheerful).
+        tempo: Target BPM (e.g. 120.0).
+        limit: Number of recommendations (1-20, default 10).
+
+    You need at least one seed (track, artist, or genre). Use now_playing or
+    recently_played to get seed track URIs, or use genre names directly.
+    """
+    sp = _get_spotify()
+    limit = max(1, min(20, limit))
+
+    seed_tracks = []
+    if seed_track_uris:
+        seed_tracks = [u.replace("spotify:track:", "") for u in seed_track_uris[:5]]
+
+    seed_artist_ids = []
+    if seed_artists:
+        seed_artist_ids = [u.replace("spotify:artist:", "") for u in seed_artists[:5]]
+
+    kwargs: dict = {}
+    if energy is not None:
+        kwargs["target_energy"] = energy
+    if danceability is not None:
+        kwargs["target_danceability"] = danceability
+    if valence is not None:
+        kwargs["target_valence"] = valence
+    if tempo is not None:
+        kwargs["target_tempo"] = tempo
+
+    total_seeds = len(seed_tracks) + len(seed_artist_ids) + len(seed_genres or [])
+    if total_seeds == 0:
+        return "Need at least one seed (track URI, artist URI, or genre name)."
+    if total_seeds > 5:
+        return "Total seeds (tracks + artists + genres) must be 5 or fewer."
+
+    results = sp.recommendations(
+        seed_tracks=seed_tracks or None,
+        seed_artists=seed_artist_ids or None,
+        seed_genres=seed_genres or None,
+        limit=limit,
+        **kwargs,
+    )
+    tracks = results.get("tracks", [])
+    if not tracks:
+        return "No recommendations found for those seeds."
+
+    lines = [f"**Recommendations ({len(tracks)} tracks):**\n"]
+    for i, track in enumerate(tracks, 1):
+        lines.append(f"{i}. {_format_track(track)}")
+        lines.append("")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def set_volume(volume_percent: int) -> str:
+    """Set the Spotify playback volume.
+
+    Args:
+        volume_percent: Volume level from 0 to 100.
+
+    Call this when the user wants to change the volume, turn it up/down, or mute.
+    """
+    sp = _get_spotify()
+    volume_percent = max(0, min(100, volume_percent))
+    try:
+        sp.volume(volume_percent)
+    except spotipy.exceptions.SpotifyException as e:
+        if "NO_ACTIVE_DEVICE" in str(e) or "Not found" in str(e):
+            return "No active Spotify device found."
+        if "VOLUME_CONTROL_DISALLOW" in str(e):
+            return "Volume control is not available on this device (common on mobile)."
+        raise
+    return f"Volume set to {volume_percent}%."
+
+
+@mcp.tool()
+def shuffle_toggle(state: bool) -> str:
+    """Turn shuffle on or off.
+
+    Args:
+        state: True to enable shuffle, False to disable.
+
+    Call this when the user says "turn on shuffle" or "stop shuffling".
+    """
+    sp = _get_spotify()
+    try:
+        sp.shuffle(state)
+    except spotipy.exceptions.SpotifyException as e:
+        if "NO_ACTIVE_DEVICE" in str(e) or "Not found" in str(e):
+            return "No active Spotify device found."
+        raise
+    return f"Shuffle {'enabled' if state else 'disabled'}."
+
+
+@mcp.tool()
+def repeat_mode(state: str = "off") -> str:
+    """Set the repeat mode.
+
+    Args:
+        state: One of "off", "track" (repeat current song), or "context" (repeat playlist/album).
+
+    Call this when the user wants to repeat a song or turn off repeat.
+    """
+    sp = _get_spotify()
+    if state not in ("off", "track", "context"):
+        return 'Invalid repeat mode. Use "off", "track", or "context".'
+    try:
+        sp.repeat(state)
+    except spotipy.exceptions.SpotifyException as e:
+        if "NO_ACTIVE_DEVICE" in str(e) or "Not found" in str(e):
+            return "No active Spotify device found."
+        raise
+    return f"Repeat mode set to: {state}."
+
+
+@mcp.tool()
+def get_queue() -> str:
+    """Get the current playback queue.
+
+    Shows what's currently playing and what tracks are coming up next.
+    Call this when the user asks "what's in my queue?" or "what's next?".
+    """
+    sp = _get_spotify()
+    queue = sp.queue()
+    lines = []
+
+    currently = queue.get("currently_playing")
+    if currently:
+        lines.append("**Currently playing:**")
+        lines.append(_format_track(currently))
+        lines.append("")
+
+    upcoming = queue.get("queue", [])
+    if upcoming:
+        lines.append(f"**Up next ({len(upcoming)} tracks):**\n")
+        for i, track in enumerate(upcoming[:20], 1):
+            lines.append(f"{i}. {_format_track(track)}")
+            lines.append("")
+    elif not currently:
+        return "Queue is empty. Nothing is playing."
+
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def get_track_features(uri: str) -> str:
+    """Get audio features for a track — energy, danceability, tempo, mood, etc.
+
+    Args:
+        uri: Spotify track URI (e.g. "spotify:track:4iV5W9uYEdYUVa79Axb7Rh").
+
+    Returns detailed audio analysis including danceability, energy, valence (happiness),
+    tempo, acousticness, instrumentalness, and more. Fun for answering
+    "what's the vibe of this song?" or comparing tracks.
+    """
+    sp = _get_spotify()
+    track_id = uri.replace("spotify:track:", "")
+    features = sp.audio_features([track_id])
+    if not features or not features[0]:
+        return f"No audio features found for `{uri}`."
+
+    f = features[0]
+    track = sp.track(track_id)
+    name = track.get("name", "Unknown")
+    artists = ", ".join(a["name"] for a in track.get("artists", []))
+
+    lines = [
+        f"**Audio features for {name} by {artists}:**\n",
+        f"  Danceability: {f.get('danceability', 0):.0%}",
+        f"  Energy: {f.get('energy', 0):.0%}",
+        f"  Valence (happiness): {f.get('valence', 0):.0%}",
+        f"  Tempo: {f.get('tempo', 0):.0f} BPM",
+        f"  Acousticness: {f.get('acousticness', 0):.0%}",
+        f"  Instrumentalness: {f.get('instrumentalness', 0):.0%}",
+        f"  Speechiness: {f.get('speechiness', 0):.0%}",
+        f"  Liveness: {f.get('liveness', 0):.0%}",
+        f"  Loudness: {f.get('loudness', 0):.1f} dB",
+        f"  Key: {f.get('key', 'N/A')} (mode: {'major' if f.get('mode') == 1 else 'minor'})",
+        f"  Time signature: {f.get('time_signature', 'N/A')}/4",
+    ]
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def play_artist(artist_name: str) -> str:
+    """Search for an artist and start playing their top tracks.
+
+    Args:
+        artist_name: The name of the artist to play.
+
+    Call this when the user says "play Drake" or "put on some Taylor Swift".
+    """
+    sp = _get_spotify()
+    results = sp.search(q=f"artist:{artist_name}", type="artist", limit=1)
+    artists = results.get("artists", {}).get("items", [])
+    if not artists:
+        return f'No artist found for "{artist_name}".'
+
+    artist = artists[0]
+    artist_uri = artist["uri"]
+    artist_display = artist["name"]
+
+    try:
+        sp.start_playback(context_uri=artist_uri)
+    except spotipy.exceptions.SpotifyException as e:
+        if "NO_ACTIVE_DEVICE" in str(e) or "Not found" in str(e):
+            return "No active Spotify device found. Open Spotify and start playing something first."
+        raise
+    return f"Now playing **{artist_display}**."
+
+
+@mcp.tool()
+def save_current_track() -> str:
+    """Save/like/heart the currently playing track to your library.
+
+    Call this when the user says "like this song", "save this", or "heart this track".
+    """
+    sp = _get_spotify()
+    playback = sp.current_playback()
+    if not playback or not playback.get("item"):
+        return "Nothing is currently playing."
+
+    track = playback["item"]
+    track_id = track["id"]
+    name = track.get("name", "Unknown")
+    artists = ", ".join(a["name"] for a in track.get("artists", []))
+
+    sp.current_user_saved_tracks_add([track_id])
+    return f"Saved **{name}** by {artists} to your library."
+
+
+@mcp.tool()
+def create_playlist(name: str, description: str = "", public: bool = False) -> str:
+    """Create a new Spotify playlist.
+
+    Args:
+        name: Name for the playlist (e.g. "Road Trip", "Study Vibes").
+        description: Optional description for the playlist.
+        public: Whether the playlist should be public (default False/private).
+
+    Returns the playlist URI which can be used with other tools.
+    Call this when the user wants to create a new playlist.
+    """
+    sp = _get_spotify()
+    user = sp.current_user()
+    user_id = user["id"]
+    playlist = sp.user_playlist_create(
+        user=user_id,
+        name=name,
+        public=public,
+        description=description,
+    )
+    uri = playlist.get("uri", "")
+    return f'Created playlist **{name}**.\n  URI: `{uri}`'
+
+
+@mcp.tool()
+def add_tracks_to_playlist(playlist_uri: str, track_uris: list[str]) -> str:
+    """Add tracks to an existing playlist.
+
+    Args:
+        playlist_uri: The Spotify URI of the playlist (from get_my_playlists or create_playlist).
+        track_uris: List of Spotify track URIs to add.
+
+    Call this after create_playlist or to add songs to an existing playlist.
+    """
+    sp = _get_spotify()
+    playlist_id = playlist_uri.replace("spotify:playlist:", "")
+    sp.playlist_add_items(playlist_id, track_uris)
+    return f"Added {len(track_uris)} tracks to playlist `{playlist_uri}`."
 
 
 # ---------------------------------------------------------------------------

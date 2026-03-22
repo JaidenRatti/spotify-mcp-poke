@@ -9,6 +9,8 @@ services:
     sync: false
   - key: SPOTIFY_CLIENT_SECRET
     sync: false
+  - key: SPOTIFY_TOKEN_JSON
+    sync: false
   - key: SPOTIFY_TOKEN_CACHE
     value: /app/.spotify_cache
   - key: TRANSPORT

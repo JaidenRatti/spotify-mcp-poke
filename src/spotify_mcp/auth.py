@@ -11,6 +11,10 @@ Sets redirect URI to http://localhost:8888/callback by default.
 
 import os
 
+from dotenv import load_dotenv
+
+load_dotenv()
+
 import spotipy
 from spotipy.oauth2 import SpotifyOAuth
 
@@ -22,6 +26,10 @@ SCOPES = " ".join(
         "user-read-recently-played",
         "playlist-read-private",
         "playlist-read-collaborative",
+        "playlist-modify-public",
+        "playlist-modify-private",
+        "user-library-modify",
+        "user-library-read",
     ]
 )
 
@@ -29,7 +37,7 @@ SCOPES = " ".join(
 def main():
     client_id = os.environ.get("SPOTIFY_CLIENT_ID")
     client_secret = os.environ.get("SPOTIFY_CLIENT_SECRET")
-    redirect_uri = os.environ.get("SPOTIFY_REDIRECT_URI", "http://localhost:8888/callback")
+    redirect_uri = os.environ.get("SPOTIFY_REDIRECT_URI", "http://127.0.0.1:8888/callback")
 
     if not client_id or not client_secret:
         print("Set SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET environment variables first.")
