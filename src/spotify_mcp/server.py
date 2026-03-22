@@ -54,9 +54,22 @@ def _get_spotify() -> spotipy.Spotify:
     # If SPOTIFY_TOKEN_JSON is set (for Render/deployments), write it to the cache file
     # so spotipy can pick it up and handle refresh automatically.
     token_json = os.environ.get("SPOTIFY_TOKEN_JSON")
-    if token_json and not os.path.exists(token_cache):
+    if not token_json:
+        # Fallback: maybe the JSON was put in SPOTIFY_TOKEN_CACHE by mistake
+        if token_cache.startswith("{"):
+            token_json = token_cache
+            token_cache = "/tmp/.spotify_cache"
+    if token_json:
+        # Strip any wrapping quotes that Render might add
+        token_json = token_json.strip().strip("'").strip('"')
+        # Validate it's actually JSON
+        try:
+            json.loads(token_json)
+        except json.JSONDecodeError:
+            print(f"WARNING: SPOTIFY_TOKEN_JSON is not valid JSON (first 50 chars): {token_json[:50]}")
         with open(token_cache, "w") as f:
             f.write(token_json)
+        print(f"Wrote token cache to {token_cache}")
 
     auth_manager = SpotifyOAuth(
         client_id=client_id,
